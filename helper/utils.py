@@ -97,6 +97,16 @@ def load_data(dataset):
 
 
 def load_partition(args, rank):
+    """
+    Returns
+    ----------
+    DGLGraph
+        the graph partition struture
+    Dict[str, Tensor]
+        including inner node features, labels, train_mask, etc.
+    GraphPartitionBook
+        The graph partition information, from the bigger picture (whole graph)
+    """
     graph_dir = 'partitions/' + args.graph_name + '/'
     part_config = graph_dir + args.graph_name + '.json'
 
