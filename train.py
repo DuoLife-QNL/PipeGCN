@@ -82,16 +82,33 @@ def move_to_cuda(graph, part, node_dict):
 
 
 def get_pos(node_dict, gpb):
+    """
+    对于world_size==4的情况，生成4个tensor，其中pos[rank]=None, rank为当前processor（称作current rank）。
+    返回的每个tensor记录了一个boundary node从它的root rank的local id到current rank的映射。
+    例如，当current rank == 2时，pos[0][23796] == tensor(37289,)表示，rank 0中local id为23796的节点是rank 0的inner node，是rank 2的boundary node，这个节点在rank 2中的local id为37289.
+
+    Parameters
+    ----------
+    node_dict
+    gpb
+
+    Returns
+    -------
+    """
     pos = []
     rank, size = dist.get_rank(), dist.get_world_size()
     for i in range(size):
         if i == rank:
             pos.append(None)
         else:
+            # rank i中inner nodes的数量
             part_size = gpb.partid2nids(i).shape[0]
+            # rank i的起始点的id
             start = gpb.partid2nids(i)[0].item()
             p = minus_one_tensor(part_size, 'cuda')
+            # 生成一个tensor，包含当前rank (processor) 中的boundary nodes中属于rank i的那些节点的序号（current rank local id）
             in_idx = nonzero_idx(node_dict['part_id'] == i)
+            # 将上面生成的tensor的节点转化成global id之后再减去rank i的start得到该节点在rank i中的local id
             out_idx = node_dict[dgl.NID][in_idx] - start
             p[out_idx] = in_idx
             pos.append(p)
@@ -111,6 +128,9 @@ def get_recv_shape(node_dict):
 
 
 def create_inner_graph(graph, node_dict):
+    """
+    Extract (u, v) such that both u and v are inner nodes of partitioned subgraph
+    """
     u, v = graph.edges()
     sel = torch.logical_and(node_dict['inner_node'].bool()[u], node_dict['inner_node'].bool()[v])
     u, v = u[sel], v[sel]
@@ -128,12 +148,14 @@ def order_graph(part, graph, gpb, node_dict, pos):
         nodes = node_dict[dgl.NID][node_dict['part_id'] == i] - start
         nodes, _ = torch.sort(nodes)
         one_hops.append(nodes)
+    # one_hops: one_hops[i]包括了当前processor的boundary_nodes中，属于rank i的那些节点在rank i中的local id
     return construct(part, graph, pos, one_hops)
 
 
 def move_train_first(graph, node_dict, boundary):
     train_mask = node_dict['train_mask']
     num_train = torch.count_nonzero(train_mask).item()
+    # TODO: 为什么只统计_V类型的点？
     num_tot = graph.num_nodes('_V')
 
     new_id = torch.zeros(num_tot, dtype=torch.int, device='cuda')
@@ -167,6 +189,10 @@ def create_graph_train(graph, node_dict):
 
 
 def precompute(graph, node_dict, boundary, recv_shape, args):
+    """
+    pre-process the feature of partition inner nodes
+    TO STUDY: 具体是怎么操作的？对应什么训练任务？
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
     in_size = node_dict['inner_node'].bool().sum()
     feat = node_dict['feat']
@@ -204,7 +230,21 @@ def reduce_hook(param, name, n_train):
 
 
 def construct(part, graph, pos, one_hops):
+    """
+
+    Parameters
+    ----------
+    part: inner_nodes生成的子图，inner graph
+    graph: partition内所有节点生成的子图
+    pos: 其它rank的inner_nodes which are boundary nodes in current rank
+    one_hops: one_hops[i]包括了当前processor的boundary_nodes中，属于rank i的那些节点在rank i中的local id。和pos是对应的关系
+
+    Returns
+    -------
+
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
+    # inner-graph节点数量
     tot = part.num_nodes()
     u, v = part.edges()
     u_list, v_list = [u], [v]
@@ -216,6 +256,7 @@ def construct(part, graph, pos, one_hops):
             if u.shape[0] == 0:
                 continue
             u = pos[i][u]
+            # TODO: 以下内容还需要仔细看
             u_ = torch.repeat_interleave(graph.out_degrees(u.int()).long()) + tot
             tot += u.shape[0]
             _, v = graph.out_edges(u.int())
@@ -223,6 +264,7 @@ def construct(part, graph, pos, one_hops):
             v_list.append(v)
     u = torch.cat(u_list)
     v = torch.cat(v_list)
+    # 异质图，src nodes的类型是 _U，dest nodes类型是_V，边的类型是_E。这部分是dgl的定义
     g = dgl.heterograph({('_U', '_E', '_V'): (u, v)})
     if g.num_nodes('_U') < tot:
         g.add_nodes(tot - g.num_nodes('_U'), ntype='_U')
@@ -240,6 +282,15 @@ def extract(graph, node_dict):
 
 
 def run(graph, node_dict, gpb, args):
+    """
+    Parameters:
+    ---
+    graph: DGLGraph
+        The subgraph belongs to current partition
+    node_dict: Dict[str, Tensor]
+        The node feature and all other information in the corresponding subgraph
+
+    """
     
     rank, size = dist.get_rank(), dist.get_world_size()
 
@@ -268,10 +319,12 @@ def run(graph, node_dict, gpb, args):
           f'{part.num_nodes()} inner nodes, and {part.num_edges()} inner edges.')
 
     graph, part, node_dict = move_to_cuda(graph, part, node_dict)
+    # 让当前processor了解其inner_nodes的信息在其它processor中的依赖情况，即哪些inner_nodes信息需要发给哪个processor。
     boundary = get_boundary(node_dict, gpb)
 
     layer_size = get_layer_size(args.n_feat, args.n_hidden, args.n_class, args.n_layers)
 
+    # 其它processor中inner_node local id到当前processor中boundary_node local id的映射
     pos = get_pos(node_dict, gpb)
     graph = order_graph(part, graph, gpb, node_dict, pos)
     in_deg = node_dict['in_degree']

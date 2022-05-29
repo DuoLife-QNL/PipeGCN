@@ -101,7 +101,7 @@ def load_partition(args, rank):
     Returns
     ----------
     DGLGraph
-        the graph partition struture
+        the graph partition structure
     Dict[str, Tensor]
         including inner node features, labels, train_mask, etc.
     GraphPartitionBook
@@ -162,32 +162,56 @@ def get_layer_size(n_feat, n_hidden, n_class, n_layers):
 
 
 def get_boundary(node_dict, gpb):
+    """
+    通过pytorch distributed point-to-point communication，使每个processor了解到其它的processor的boundary_nodes中，有哪些属于本processor。
+    换句话说，让每个processor知道其它的任意processor需要它的哪些inner_nodes的信息。
+    Parameters
+    ----------
+    node_dict
+    gpb
+
+    Returns
+    -------
+    boundary[i]表示rank i需要当前processor中的哪些inner_nodes节点来作为其boundary_nodes
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
     device = 'cuda'
     boundary = [None] * size
 
     for i in range(1, size):
+        # left, right: rank左边（右边）第i个processor（processor之间是链式传播）
         left = (rank - i + size) % size
         right = (rank + i) % size
         belong_right = (node_dict['part_id'] == right)
+        # num_right表示partition中有多少boundary_node属于右边第i个processor
         num_right = belong_right.sum().view(-1)
         if dist.get_backend() == 'gloo':
             num_right = num_right.cpu()
             num_left = torch.tensor([0])
         else:
             num_left = torch.tensor([0], device=device)
+        # 每个processor向右边第i个processor发送其内部有多少个属于后者的节点，这些节点的信息之后需要从右侧的processor中拿
+        # 每个processor接收从左边第i个processor的报告，得知后者内部有多少个属于前者的节点，这些节点需要当前processor发送给左侧
         req = dist.isend(num_right, dst=right)
         dist.recv(num_left, src=left)
+
+        # partid2nids: given a partition id and return the inside node global ids
+        # start: the start vertex in the i-th right processor, global id
         start = gpb.partid2nids(right)[0].item()
+        # v: the local ids of boundary vertex which originally belong to the i-th right processor
+        # v 是要发送到i-th right processor上去的
         v = node_dict[dgl.NID][belong_right] - start
         if dist.get_backend() == 'gloo':
             v = v.cpu()
             u = torch.zeros(num_left, dtype=torch.long)
         else:
             u = torch.zeros(num_left, dtype=torch.long, device=device)
+        # 需要等上一次req发送完之后（关于有多少个boundary_nodes）再发送具体的boundary_nodes是那些
         req.wait()
         req = dist.isend(v, dst=right)
+
         dist.recv(u, src=left)
+        # 因为每个processor内部存的boundary nodes并不是有序的，所以这里original processor收到数据后需要排个序
         u, _ = torch.sort(u)
         if dist.get_backend() == 'gloo':
             boundary[left] = u.cuda()
@@ -248,6 +272,16 @@ def minus_one_tensor(size, device=None):
 
 
 def nonzero_idx(x):
+    """
+    获取x中各非零项的第一维坐标，返回一个一行的tensor表示
+    Parameters
+    ----------
+    x
+
+    Returns
+    -------
+
+    """
     return torch.nonzero(x, as_tuple=True)[0]
 
 

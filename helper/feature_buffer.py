@@ -42,6 +42,11 @@ class Buffer(object):
                 tot += s
                 self._pr.append(tot)
 
+    """
+    @num_in: the number of inner nodes in the partition
+    @num_all: partition中的src vertex数量
+    
+    """
     def init_buffer(self, num_in, num_all, boundary, f_recv_shape, layer_size, use_pp=False, backend='gloo',
                     pipeline=False, corr_feat=False, corr_grad=False, corr_momentum=0):
         rank, size = dist.get_rank(), dist.get_world_size()

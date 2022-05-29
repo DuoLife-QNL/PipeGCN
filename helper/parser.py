@@ -48,6 +48,7 @@ def create_parser():
 
     parser.add_argument("--use-pp", "--use_pp", action='store_true',
                         help="whether to use precomputation")
+    # 是否用inductive learning的方式。GraphSAGE是经典的inductive的方式。具体差别参加论文。
     parser.add_argument("--inductive", action='store_true',
                         help="inductive learning setting")
     parser.add_argument("--fix-seed", "--fix_seed", action='store_true',
