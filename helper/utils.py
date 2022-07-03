@@ -223,12 +223,30 @@ def get_boundary(node_dict, gpb):
 
 
 def data_transfer(data, recv_shape, backend, dtype=torch.float, tag=0):
+    """
+    Parameters
+    各processor将data（inner node的信息）发送给对应需要的processor
+    data指明了当前processor需要发送给其它processor的信息；
+    recv_shape指明了当前processor需要接受的来自其它processor的信息量
+    ----------
+    data：当前processor需要发给其它processor的信息
+    recv_shape: 需要从其它每个processor获取的节点的数量
+    backend
+    dtype
+    tag
+
+    Returns
+    -------
+
+    """
     rank, size = dist.get_rank(), dist.get_world_size()
     res = [None] * size
 
     for i in range(1, size):
         left = (rank - i + size) % size
         if backend == 'gloo':
+            # recv_shape[left]: 从左侧某processor中需要获取的节点的数量
+            # data[left].shape[1]: 节点特征的维度。这里应该没有必要用left，因为所有节点的特征维度是一样的，用left只是顺便而已。
             res[left] = torch.zeros(torch.Size([recv_shape[left], data[left].shape[1]]), dtype=dtype)
         else:
             res[left] = torch.zeros(torch.Size([recv_shape[left], data[left].shape[1]]), dtype=dtype, device='cuda')
@@ -240,6 +258,7 @@ def data_transfer(data, recv_shape, backend, dtype=torch.float, tag=0):
             req = dist.isend(data[right].cpu(), dst=right, tag=tag)
         else:
             req = dist.isend(data[right], dst=right, tag=tag)
+        # 注意recv是同步操作
         dist.recv(res[left], src=left, tag=tag)
         res[left] = res[left].cuda()
         req.wait()

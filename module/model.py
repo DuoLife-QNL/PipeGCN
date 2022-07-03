@@ -2,6 +2,7 @@ from module.layer import *
 from torch import nn
 from module.sync_bn import SyncBatchNorm
 from helper import context as ctx
+import torch.distributed as dist
 
 
 class GNNBase(nn.Module):
@@ -12,6 +13,7 @@ class GNNBase(nn.Module):
         self.layers = nn.ModuleList()
         self.activation = activation
         self.use_pp = use_pp
+        # 最后接的n个线性层
         self.n_linear = n_linear
 
         if norm is None:
@@ -43,6 +45,8 @@ class GraphSAGE(GNNBase):
         for i in range(self.n_layers):
             if i < self.n_layers - self.n_linear:
                 if self.training and (i > 0 or not self.use_pp):
+                    # 从buffer中获得这一层的stale hidden features。同时将当前epoch计算出来的h由每个processor广播出去。
+                    # 在此处forward执行的时候，feat和h实际上是针对每个processor内部的inner_node的。也就是说，每个processor内部都有完整的模型，而feature是部分的feature，故为数据并行。
                     h = ctx.buffer.update(i, h)
                 h = self.dropout(h)
                 h = self.layers[i](g, h, in_deg)

@@ -1,3 +1,5 @@
+PipeGCN实际上不是基于采样的GraphSAGE。聚合过程中是聚合了所有的节点。它只使用了GraphSAGE中inductive GNN的思路。
+
 一些数据结构
 
 node_dict: 包含当然rank中全部节点（inner_node和boundary_node的信息）

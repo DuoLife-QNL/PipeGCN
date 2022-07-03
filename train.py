@@ -86,7 +86,7 @@ def get_pos(node_dict, gpb):
     对于world_size==4的情况，生成4个tensor，其中pos[rank]=None, rank为当前processor（称作current rank）。
     返回的每个tensor记录了一个boundary node从它的root rank的local id到current rank的映射。
     例如，当current rank == 2时，pos[0][23796] == tensor(37289,)表示，rank 0中local id为23796的节点是rank 0的inner node，是rank 2的boundary node，这个节点在rank 2中的local id为37289.
-
+    这个函数的作用是，了解其它processor的inner node在当前processor中存储的index是多少
     Parameters
     ----------
     node_dict
@@ -153,15 +153,36 @@ def order_graph(part, graph, gpb, node_dict, pos):
 
 
 def move_train_first(graph, node_dict, boundary):
+    """
+    按照是否是训练节点对inner nodes排序，训练节点在前，非训练节点在后。并同时根据new id更改对应的node_dict和boundary的信息。
+    这里没有move cuda相关的操作。
+    Parameters
+    ----------
+    graph
+    node_dict
+    boundary
+
+    Returns
+    -------
+
+    """
     train_mask = node_dict['train_mask']
+    # 当前processor中需要训练的节点数量
     num_train = torch.count_nonzero(train_mask).item()
-    # TODO: 为什么只统计_V类型的点？
+    # 只统计V类型的点：V类型的点是inner_nodes，U类型的点有inner nodes也有boundary nodes
+    # 也有可能某个inner node是孤立节点，在之前的partition graph里是有这种节点的信息，但在现在的order graph中，这部分节点不保存
+    # 这里的num_tot就是当前processor中非孤立inner nodes的数量
     num_tot = graph.num_nodes('_V')
 
+    # 对所有inner nodes重排序，分配新的id。训练节点放在前，非训练节点放在后。
     new_id = torch.zeros(num_tot, dtype=torch.int, device='cuda')
+    # 为每一个训练节点分配一个新id
     new_id[train_mask] = torch.arange(num_train, dtype=torch.int, device='cuda')
+    # 为inner graph中非训练节点分配后续的id
     new_id[torch.logical_not(train_mask)] = torch.arange(num_train, num_tot, dtype=torch.int, device='cuda')
 
+    # 转换成新的id表示。
+    # TODO: 转换方式没有看懂
     u, v = graph.edges()
     u[u < num_tot] = new_id[u[u < num_tot].long()]
     v = new_id[v.long()]
@@ -191,7 +212,8 @@ def create_graph_train(graph, node_dict):
 def precompute(graph, node_dict, boundary, recv_shape, args):
     """
     pre-process the feature of partition inner nodes
-    TO STUDY: 具体是怎么操作的？对应什么训练任务？
+    对所有V进行一次mean aggregation。
+    因为GraphSAGE在训练过程中，第0层首先开始一次聚合，这个可以在每次训练过程中算，但也可以在训练之前先对所有的节点进行一次预计算，算出第0层这个mean aggregation的聚合结果，之后再使用NN变换以及后面各层的训练。
     """
     rank, size = dist.get_rank(), dist.get_world_size()
     in_size = node_dict['inner_node'].bool().sum()
@@ -202,6 +224,7 @@ def precompute(graph, node_dict, boundary, recv_shape, args):
             send_info.append(None)
         else:
             send_info.append(feat[b])
+    # 交换inner node信息。当前processor发送给其它processor，并从其它processor处接受boundary nodes的特征信息，即为返回的recv_feat。
     recv_feat = data_transfer(send_info, recv_shape, args.backend, dtype=torch.float)
     if args.model == 'graphsage':
         with graph.local_scope():
@@ -231,12 +254,12 @@ def reduce_hook(param, name, n_train):
 
 def construct(part, graph, pos, one_hops):
     """
-
+    把整个partition内的点、边进行重新排序。边的顺序是首先inner graph的边，然后是和processor 0相关的节点、边。节点的local id顺序也是按照这种优先级进行的重排序。
     Parameters
     ----------
     part: inner_nodes生成的子图，inner graph
     graph: partition内所有节点生成的子图
-    pos: 其它rank的inner_nodes which are boundary nodes in current rank
+    pos: 其它rank的inner_nodes which are boundary nodes in current rank，指示其它processor中的inner_node在当前processor中的index是多少（是当前processor的boundary node）
     one_hops: one_hops[i]包括了当前processor的boundary_nodes中，属于rank i的那些节点在rank i中的local id。和pos是对应的关系
 
     Returns
@@ -247,6 +270,7 @@ def construct(part, graph, pos, one_hops):
     # inner-graph节点数量
     tot = part.num_nodes()
     u, v = part.edges()
+    # 先添加inner-graph的边
     u_list, v_list = [u], [v]
     for i in range(size):
         if i == rank:
@@ -255,18 +279,23 @@ def construct(part, graph, pos, one_hops):
             u = one_hops[i]
             if u.shape[0] == 0:
                 continue
+            # 下面的等式左边的u，就是另一个processor的inner node分别在当前processor中的index。是按照inner node的顺序排列的。
             u = pos[i][u]
-            # TODO: 以下内容还需要仔细看
+            # 形成一个列表，对应所有的boundary_nodes形成的src节点
             u_ = torch.repeat_interleave(graph.out_degrees(u.int()).long()) + tot
+            # tot表示为中心节点的数量和与processor i相关的boudary nodes的数量之和
             tot += u.shape[0]
+            # 这里得到的v应该都是inner nodes
             _, v = graph.out_edges(u.int())
             u_list.append(u_.int())
             v_list.append(v)
     u = torch.cat(u_list)
     v = torch.cat(v_list)
     # 异质图，src nodes的类型是 _U，dest nodes类型是_V，边的类型是_E。这部分是dgl的定义
+    # 这里的v类型的节点应该都是inner node
     g = dgl.heterograph({('_U', '_E', '_V'): (u, v)})
     if g.num_nodes('_U') < tot:
+        # 看起来正常的情况不会进入这个分支
         g.add_nodes(tot - g.num_nodes('_U'), ntype='_U')
     return g
 
@@ -326,11 +355,15 @@ def run(graph, node_dict, gpb, args):
 
     # 其它processor中inner_node local id到当前processor中boundary_node local id的映射
     pos = get_pos(node_dict, gpb)
+    # order graph是图结构
     graph = order_graph(part, graph, gpb, node_dict, pos)
     in_deg = node_dict['in_degree']
 
+    # graph是图结构，node_dict是节点的特征，boundary标记了训练过程中数据的传输
+    # 将partition内的inner node进行一次重排序，并更改对应的信息
     graph, node_dict, boundary = move_train_first(graph, node_dict, boundary)
 
+    # 获取需要从其它的processor中获取的节点信息的数量。即当前processor中有多少个boundary node属于其它任一processor i
     recv_shape = get_recv_shape(node_dict)
 
     ctx.buffer.init_buffer(num_in, graph.num_nodes('_U'), boundary, recv_shape, layer_size[:args.n_layers-args.n_linear],

@@ -15,6 +15,18 @@ class Buffer(object):
         self._layer_size = []
         self._pipeline = False
         self._epoch = 0
+
+        # feat_cpu[i]中存的是需要发给processor i的feat数据
+        # f_recv_cpu[i]中存需要从processor i中接受到的数据
+        """
+        back_propagation阶段需要用到。
+        grad_cpu对应forward时收到的节点的梯度，需要将这些节点梯度传输回去;
+        b_recv_cpu对应forward时发送出去的节点，需要在back propagation阶段接收这些节点的梯度。故大小的对应关系是：
+        back       -- forward
+        grad_cpu   -- f_recv_cpu
+        b_recv_cpu -- feat_cpu
+        """
+        # 无cpu后缀的是存在processor中的
         self._feat_cpu, self._grad_cpu = [], []
         self._f_buf = []
         self._f_recv, self._b_recv = [], []
@@ -28,6 +40,7 @@ class Buffer(object):
         self._backend = None
         self._corr_momentum = 0
         self._corr_feat, self._corr_grad = False, False
+        # partition left index, right index
         self._pl, self._pr = [], []
 
     def __init_pl_pr(self):
@@ -44,8 +57,12 @@ class Buffer(object):
 
     """
     @num_in: the number of inner nodes in the partition
-    @num_all: partition中的src vertex数量
-    
+    @num_all: partition中的src vertex数量（可以理解为partition内的节点总数, inner + boundary）
+    @boundary: 记录processor的inner nodes被其它的哪些processor需要
+    @f_recv_shape: 需要从其它的每个processor中获取多少个节点的信息
+    @layer_size: 每一层的feature size
+    @use_pp: use pre-computation
+    @corr_feat: apply smoothing correction to stale features
     """
     def init_buffer(self, num_in, num_all, boundary, f_recv_shape, layer_size, use_pp=False, backend='gloo',
                     pipeline=False, corr_feat=False, corr_grad=False, corr_momentum=0):
@@ -78,9 +95,19 @@ class Buffer(object):
                         tmp2.append(torch.zeros(s2).pin_memory())
                         tmp3.append(torch.zeros(s2).pin_memory())
                         tmp4.append(torch.zeros(s1).pin_memory())
+                # feat_cpu[i]中存的是需要发给processor i的feat数据
                 self._feat_cpu[i] = tmp1
+                # f_recv_cpu[i]中存需要从processor i中接收到的数据
                 self._f_recv_cpu[i] = tmp3
                 if i > 0:
+                    """
+                    back_propagation阶段需要用到。
+                    grad对应forward时收到的节点的梯度，需要将这些节点梯度传输回去;
+                    b_recv对应forward时发送出去的节点，需要在back propagation阶段接收这些节点的梯度。故大小的对应关系是：
+                    back       -- forward
+                    grad_cpu   -- f_recv_cpu
+                    b_recv_cpu -- feat_cpu
+                    """
                     self._grad_cpu[i] = tmp2
                     self._b_recv_cpu[i] = tmp4
 
@@ -100,6 +127,7 @@ class Buffer(object):
         for i in range(self._n_layers):
             if i == 0 and use_pp:
                 continue
+            # f_buf存的是当前partition中src节点的特征，这些特征需要用于训练。update函数中最后返回的亦是此项。
             self._f_buf[i] = torch.zeros([num_all, self._layer_size[i]], device='cuda')
             tmp1, tmp2, tmp3, tmp4 = [], [], [], []
             for j in range(size):
@@ -146,6 +174,18 @@ class Buffer(object):
         return torch.cat(tmp)
 
     def update(self, layer, feat):
+        """
+
+        Parameters
+        ----------
+        layer: int, 标记GNN中第几层
+        feat: layer层inner_nodes的最新的feature，需要传给其它processor。这里的feat中的节点数量与processor的inner node数量相等。
+
+        Returns
+        -------
+        tensor: Stale feature. 返回的feature的节点数量和processor中的boundary nodes相同。这对应了论文中所说的inner node的feature用current iteration, boundary nodes的feature用previous iteration.
+        """
+        # 为什么需要在这个位置进行一次cuda的sync?
         torch.cuda.current_stream().synchronize()
         if self._pipeline is False:
             with comm_timer.timer(f'forward_{layer}'):
@@ -158,6 +198,7 @@ class Buffer(object):
         else:
             if self._epoch > 0:
                 with comm_timer.timer(f'forward_{layer}'):
+                    # TODO: 这里计时操作里做了什么事情？
                     self._f_cpu_event[layer].wait()
                     torch.cuda.current_stream().wait_event(self._f_cuda_event[layer])
                     self._f_cpu_event[layer].clear()
@@ -168,6 +209,7 @@ class Buffer(object):
             return self._f_buf[layer]
 
     def __gloo_all_to_all(self, send_gpu, send_cpu, recv_cpu, recv_gpu, tag, corr, avg=None, forward=True):
+        # TODO: 为什么参数同时涉及到CPU和GPU？
         rank, size = dist.get_rank(), dist.get_world_size()
         req1, req2 = [], queue.Queue()
         self._comm_stream.wait_stream(torch.cuda.current_stream())
@@ -178,8 +220,10 @@ class Buffer(object):
                 r2 = dist.irecv(recv_cpu[left], tag=tag, src=left)
                 req2.put((r2, left))
                 if forward:
+                    # forward阶段发送inner_node，用boundary来指示
                     send_cpu[right].copy_(send_gpu[self._boundary[right]])
                 else:
+                    # backward阶段，发送boundary_node，用pl,pr指针来指示发送的boundary nodes index区间
                     send_cpu[right].copy_(send_gpu[self._pl[right]:self._pr[right]])
                 r1 = dist.isend(send_cpu[right], tag=tag, dst=right)
                 req1.append(r1)
