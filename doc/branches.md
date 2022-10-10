@@ -1,0 +1,5 @@
+分支说明
+
+past_several_epochs:
+
+实现processor内存多个buffer的方案，从而使单个gpu可以使用多个epoch之前的数据，从而避免当前一个epoch信息没有传完的情况下需要的同步等待。详细内容见`several_epochs_information.md`

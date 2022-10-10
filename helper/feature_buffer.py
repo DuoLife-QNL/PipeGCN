@@ -4,6 +4,7 @@ from multiprocessing import Event
 from helper.timer.timer import *
 import queue
 
+BOUNDED_STALENESS = 2
 
 class Buffer(object):
 
@@ -16,10 +17,13 @@ class Buffer(object):
         self._pipeline = False
         self._epoch = 0
 
-        # feat_cpu[i]中存的是需要发给processor i的feat数据
-        # f_recv_cpu[i]中存需要从processor i中接受到的数据
         """
-        back_propagation阶段需要用到。
+        feat_cpu[i]中存的是需要发给其它processor的第i层的feat数据。
+        feat_cpu[i][j]代表需要向processor j发送的第i层的数据。是一个tensor。
+        f_recv_cpu[i]中存需要从其它processor中获取的第i层的特征。
+        f_recv_cpu[i][j]代表需要从processor j中获取的第i层的节点特征。是一个tensor。
+    
+        grad_cpu和b_recv_cpu在back_propagation阶段需要用到。
         grad_cpu对应forward时收到的节点的梯度，需要将这些节点梯度传输回去;
         b_recv_cpu对应forward时发送出去的节点，需要在back propagation阶段接收这些节点的梯度。故大小的对应关系是：
         back       -- forward
@@ -58,7 +62,8 @@ class Buffer(object):
     """
     @num_in: the number of inner nodes in the partition
     @num_all: partition中的src vertex数量（可以理解为partition内的节点总数, inner + boundary）
-    @boundary: 记录processor的inner nodes被其它的哪些processor需要
+    @boundary: 记录processor的inner nodes被其它的哪些processor需要。
+               list, boundary[j]包含了processor j需要的来自于当前processor的节点列表
     @f_recv_shape: 需要从其它的每个processor中获取多少个节点的信息
     @layer_size: 每一层的feature size
     @use_pp: use pre-computation
@@ -95,9 +100,9 @@ class Buffer(object):
                         tmp2.append(torch.zeros(s2).pin_memory())
                         tmp3.append(torch.zeros(s2).pin_memory())
                         tmp4.append(torch.zeros(s1).pin_memory())
-                # feat_cpu[i]中存的是需要发给processor i的feat数据
+                # feat_cpu[i]中存的是需要发给其它processor的第i层的feat数据。
                 self._feat_cpu[i] = tmp1
-                # f_recv_cpu[i]中存需要从processor i中接收到的数据
+                # f_recv_cpu[i]中存需要从其它processor中获取的第i层的特征。
                 self._f_recv_cpu[i] = tmp3
                 if i > 0:
                     """
@@ -185,7 +190,8 @@ class Buffer(object):
         -------
         tensor: Stale feature. 返回的feature的节点数量和processor中的boundary nodes相同。这对应了论文中所说的inner node的feature用current iteration, boundary nodes的feature用previous iteration.
         """
-        # 为什么需要在这个位置进行一次cuda的sync?
+        # 为什么需要在这个位置进行一次cuda的sync? 注释掉程序也不会出bug？
+        # 是用于同步gloo_all_to_all函数里的stream?
         torch.cuda.current_stream().synchronize()
         if self._pipeline is False:
             with comm_timer.timer(f'forward_{layer}'):
@@ -202,7 +208,9 @@ class Buffer(object):
                     self._f_cpu_event[layer].wait()
                     torch.cuda.current_stream().wait_event(self._f_cuda_event[layer])
                     self._f_cpu_event[layer].clear()
+            # 先拼接feature
             self._f_buf[layer] = self.__feat_concat(layer, feat)
+            # 再进行传输
             self._pool.apply_async(self.__feat_transfer, args=(self._epoch, layer, feat))
             if self._f_buf[layer].requires_grad:
                 self._f_buf[layer].register_hook(self.__grad_hook(self._epoch, layer))
@@ -211,6 +219,8 @@ class Buffer(object):
     def __gloo_all_to_all(self, send_gpu, send_cpu, recv_cpu, recv_gpu, tag, corr, avg=None, forward=True):
         # TODO: 为什么参数同时涉及到CPU和GPU？
         rank, size = dist.get_rank(), dist.get_world_size()
+        # req1: send 任务
+        # req2: receive 任务队列
         req1, req2 = [], queue.Queue()
         self._comm_stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(self._comm_stream):
@@ -221,6 +231,7 @@ class Buffer(object):
                 req2.put((r2, left))
                 if forward:
                     # forward阶段发送inner_node，用boundary来指示
+                    # 调用的tensor的copy_方法
                     send_cpu[right].copy_(send_gpu[self._boundary[right]])
                 else:
                     # backward阶段，发送boundary_node，用pl,pr指针来指示发送的boundary nodes index区间
@@ -239,10 +250,11 @@ class Buffer(object):
                         t *= self._corr_momentum
                         t += (1 - self._corr_momentum) * recv_gpu[idx]
             # TODO: remove this 'wait'
-            for r in req1:
-                r.wait()
+            # for r in req1:
+            #     r.wait()
 
     def __feat_transfer(self, epoch, layer, feat):
+        # TODO: 这里为什么*2?
         tag = epoch * 2 * self._n_layers + layer
         if self._backend == 'gloo':
             self.__gloo_all_to_all(feat, self._feat_cpu[layer], self._f_recv_cpu[layer], self._f_recv[layer],
